@@ -11,6 +11,18 @@ La emisora del ñu que te da nota.
 Este addon fue creado para hablar en vivo con los locutores de la radio.
 También puede ser usado para reportar incidencias del portal Web.
 
+### Now Playing
+
+Mostrar lo que estoy escuchando en RadioÑú.
+
+Si desea mostrar a sus contactos la música que estás escuchando en ese mismo momento, marque "Enable Status" desde la ventana de complementos.
+
+Su estado se actualizará automáticamente cada vez que se inicia una nueva canción con la API pública de RadioÑú, con indicación del nombre de la pista y el artista.
+
+Si lo deshabilita, su estado mostrará el valor predeterminado Disponible u Ocupado mas su estatus anterior.
+
+Si desea mostrar a sus contactos la caratula del album que estás escuchando en ese mismo momento, marque "Enable Album Art" desde la ventana de complementos.
+
 ### Acerca de
 
 RadioGNU (se pronuncia RadioÑú) es un espacio radial donde se difunden los valores del Software Libre. Es principalmente un medio para tecnólogos, pero acepta distintas manifestaciones científicas y culturales que sostienen la defensa de valores éticos al compartir el arte y el conocimiento.
