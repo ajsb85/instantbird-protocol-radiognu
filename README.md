@@ -11,17 +11,11 @@ La emisora del ñu que te da nota.
 Este addon fue creado para hablar en vivo con los locutores de la radio.
 También puede ser usado para reportar incidencias del portal Web.
 
-### Now Playing
+### Descargalo
 
-Mostrar lo que estoy escuchando en RadioÑú.
-
-Si desea mostrar a sus contactos la música que estás escuchando en ese mismo momento, marque "Enable Status" desde la ventana de complementos.
-
-Su estado se actualizará automáticamente cada vez que se inicia una nueva canción con la API pública de RadioÑú, con indicación del nombre de la pista y el artista.
-
-Si lo deshabilita, su estado mostrará el valor predeterminado Disponible u Ocupado mas su estatus anterior.
-
-Si desea mostrar a sus contactos la caratula del album que estás escuchando en ese mismo momento, marque "Enable Album Art" desde la ventana de complementos.
+Compatible con Thunderbird / Icedove / Guacharo / Instantbird <br>
+https://addons.mozilla.org/addon/prpl-radiognu/ <br>
+https://addons.instantbird.org/addon/381/
 
 ### Acerca de
 
