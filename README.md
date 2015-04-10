@@ -1,14 +1,9 @@
-# RadioGNU Protocol
-Assists to setup a chat account for RadioGNU
-
-Español (Spanish)
-
 ### RadioÑú
 La emisora del ñu que te da nota.
 
 ### Chat
 
-Este addon fue creado para hablar en vivo con los locutores de la radio.
+Este add-on fue creado para hablar en vivo con los locutores de la radio. <br>
 También puede ser usado para reportar incidencias del portal Web.
 
 ### Descargalo
