@@ -9,6 +9,7 @@ Cu.import("resource:///modules/imServices.jsm");
 Cu.import("resource:///modules/ircUtils.jsm");
 Cu.import("resource:///modules/ircHandlers.jsm");
 Cu.import("resource:///modules/jsProtoHelper.jsm");
+Cu.import("resource:///modules/NormalizedMap.jsm");
 Cu.import("resource:///modules/socket.jsm");
 
 XPCOMUtils.defineLazyModuleGetter(this, "PluralForm",
@@ -24,20 +25,26 @@ XPCOMUtils.defineLazyModuleGetter(this, "DownloadUtils",
  *   command    A string that is the command or response code.
  *   params     An array of strings for the parameters. The last parameter is
  *              stripped of its : prefix.
- * If the message is from a user:
- *   nickname   The user's nickname.
+ *   origin     The user's nickname or the server who sent the message. Can be
+ *              a host (e.g. irc.mozilla.org) or an IPv4 address (e.g. 1.2.3.4)
+ *              or an IPv6 address (e.g. 3ffe:1900:4545:3:200:f8ff:fe21:67cf).
  *   user       The user's username, note that this can be undefined.
  *   host       The user's hostname, note that this can be undefined.
  *   source     A "nicely" formatted combination of user & host, which is
  *              <user>@<host> or <user> if host is undefined.
- * Otherwise if it's from a server:
- *   servername This is the address of the server as a host (e.g.
- *              irc.mozilla.org) or an IPv4 address (e.g. 1.2.3.4) or IPv6
- *              address (e.g. 3ffe:1900:4545:3:200:f8ff:fe21:67cf).
+ *
+ * There are cases (e.g. localhost) where it cannot be easily determined if a
+ * message is from a server or from a user, thus the usage of a generic "origin"
+ * instead of "nickname" or "servername".
+ *
+ * Inputs:
+ *  aData       The raw string to parse, it should already have the \r\n
+ *              stripped from the end.
+ *  aOrigin     The default origin to use for unprefixed messages.
  */
-function radiognuMessage(aData) {
+function radiognuMessage(aData, aOrigin) {
   let message = {rawMessage: aData};
-  let temp, prefix;
+  let temp;
 
   // Splits the raw string into four parts (the second is required), the command
   // is required. A raw string looks like:
@@ -56,8 +63,6 @@ function radiognuMessage(aData) {
   if (!(temp = aData.match(/^(?::([^ ]+) )?([^ ]+)((?: +[^: ][^ ]*)*)? *(?::([\s\S]*))?$/)))
     throw "Couldn't parse message: \"" + aData + "\"";
 
-  // Assume message is from the server if not specified
-  prefix = temp[1];
   message.command = temp[2];
   // Space separated parameters. Since we expect a space as the first thing
   // here, we want to ignore the first value (which is empty).
@@ -66,22 +71,24 @@ function radiognuMessage(aData) {
   if (temp[4] != undefined)
     message.params.push(temp[4]);
 
-  // The source string can be split into multiple parts as:
-  //   :(server|nickname[[!user]@host])
-  // If the source contains a . or a :, assume it's a server name. See RFC
-  // 2812 Section 2.3 definition of servername vs. nickname.
-  if (prefix &&
-      (temp = prefix.match(/^([^ !@\.:]+)(?:!([^ @]+))?(?:@([^ ]+))?$/))) {
-    message.nickname = temp[1];
-    message.user = temp[2] || null; // Optional
-    message.host = temp[3] || null; // Optional
-    if (message.user)
-      message.source = message.user + "@" + message.host;
-    else
-      message.source = message.host; // Note: this can be null!
-  }
-  else if (prefix)
-    message.servername = prefix;
+  // Handle the prefix part of the message per RFC 2812 Section 2.3.
+
+  // If no prefix is given, assume the current server is the origin.
+  if (!temp[1])
+    temp[1] = aOrigin;
+
+  // Split the prefix into separate nickname, username and hostname fields as:
+  //   :(servername|(nickname[[!user]@host]))
+  [message.origin, message.user, message.host] = temp[1].split(/[!@]/);
+
+  // It is occasionally useful to have a "source" which is a combination of
+  // user@host.
+  if (message.user)
+    message.source = message.user + "@" + message.host;
+  else if (message.host)
+    message.source = message.host;
+  else
+    message.source = "";
 
   return message;
 }
@@ -93,23 +100,14 @@ function radiognuMessage(aData) {
 function _setMode(aAddNewMode, aNewModes) {
   // Check each mode being added/removed.
   for each (let newMode in aNewModes) {
-    let index = this._modes.indexOf(newMode);
+    let hasMode = this._modes.has(newMode);
     // If the mode is in the list of modes and we want to remove it.
-    if (index != -1 && !aAddNewMode)
-      this._modes.splice(index, 1);
+    if (hasMode && !aAddNewMode)
+      this._modes.delete(newMode);
     // If the mode is not in the list of modes and we want to add it.
-    else if (index == -1 && aAddNewMode)
-      this._modes.push(newMode);
+    else if (!hasMode && aAddNewMode)
+      this._modes.add(newMode);
   }
-}
-
-// This copies all the properties of aBase to aPrototype (which is expected to
-// be the prototype of an object). This is necessary because JavaScript does not
-// support multiple inheritance and both conversation objects have a lot of
-// shared code (but inherit from objects exposing different XPCOM interfaces).
-function copySharedBaseToPrototype(aBase, aPrototype) {
-  for (let property in aBase)
-    aPrototype[property] = aBase[property];
 }
 
 // Properties / methods shared by both radiognuChannel and radiognuConversation.
@@ -133,9 +131,14 @@ const GenericIRCConversation = {
     return this._account.maxMessageLength -
            this._account.countBytes(baseMessage);
   },
-  sendMsg: function(aMessage) {
+  // Apply CTCP formatting before displaying.
+  prepareForDisplaying: function(aMsg) {
+    aMsg.displayMessage = ctcpFormatToHTML(aMsg.displayMessage);
+    GenericConversationPrototype.prepareForDisplaying.apply(this, arguments);
+  },
+  prepareForSending: function(aOutgoingMessage, aCount) {
     // Split the message by line breaks and send each one individually.
-    let messages = aMessage.split(/[\r\n]+/);
+    let messages = aOutgoingMessage.message.split(/[\r\n]+/);
 
     let maxLength = this.getMaxMessageLength();
 
@@ -158,24 +161,28 @@ const GenericIRCConversation = {
                       message.substr((index + 1) || maxLength));
     }
 
-    // Send each message and display it in the conversation.
-    for (let message of messages) {
-      if (!message.length)
-        return;
+    if (aCount)
+      aCount.value = messages.length;
 
-      if (!this._account.sendMessage("PRIVMSG", [this.name, message])) {
-        this.writeMessage(this._account._currentServerName,
-                          _("error.sendMessageFailed"),
-                          {error: true, system: true});
-        break;
-      }
+    return messages;
+  },
+  sendMsg: function(aMessage, aIsNotice) {
+    if (!aMessage.length)
+      return;
 
-      // Since the server doesn't send us a message back, just assume the
-      // message was received and immediately show it.
-      this.writeMessage(this._account._nickname, message, {outgoing: true});
-
-      this._pendingMessage = true;
+    if (!this._account.sendMessage(aIsNotice ? "NOTICE" : "PRIVMSG",
+                                   [this.name, aMessage])) {
+      this.writeMessage(this._account._currentServerName,
+                        _("error.sendMessageFailed"),
+                        {error: true, system: true});
+      return;
     }
+
+    // Since the server doesn't send us a message back, just assume the
+    // message was received and immediately show it.
+    this.writeMessage(this._account._nickname, aMessage, {outgoing: true});
+
+    this._pendingMessage = true;
   },
   // IRC doesn't support typing notifications, but it does have a maximum
   // message length.
@@ -212,8 +219,8 @@ const GenericIRCConversation = {
     // If we are waiting for the conversation name, set it.
     let account = this._account;
     if (this._waitingForNick && nick == this.normalizedName) {
-      if (hasOwnProperty(account.whoisInformation, nick))
-        this.updateNick(account.whoisInformation[nick]["nick"]);
+      if (account.whoisInformation.has(nick))
+        this.updateNick(account.whoisInformation.get(nick)["nick"]);
       delete this._waitingForNick;
       return;
     }
@@ -221,15 +228,15 @@ const GenericIRCConversation = {
     // Otherwise, print the requested whois information.
     let type = {system: true, noLog: true};
     // RFC 2812 errors 401 and 406 result in there being no entry for the nick.
-    if (!hasOwnProperty(account.whoisInformation, nick)) {
+    if (!account.whoisInformation.has(nick)) {
       this.writeMessage(null, _("message.unknownNick", nick), type);
       return;
     }
     // If the nick is offline, tell the user. In that case, it's WHOWAS info.
     let msgType = "message.whois";
-    if ("offline" in account.whoisInformation[nick])
+    if ("offline" in account.whoisInformation.get(nick))
       msgType = "message.whowas";
-    let msg = _(msgType, account.whoisInformation[nick]["nick"]);
+    let msg = _(msgType, account.whoisInformation.get(nick)["nick"]);
 
     // Iterate over each field.
     let tooltipInfo = aSubject.QueryInterface(Ci.nsISimpleEnumerator);
@@ -262,34 +269,21 @@ const GenericIRCConversation = {
 
 function radiognuChannel(aAccount, aName, aNick) {
   this._init(aAccount, aName, aNick);
-  this._modes = [];
+  this._participants = new NormalizedMap(this.normalizeNick.bind(this));
+  this._modes = new Set();
   this._observedNicks = [];
   this.banMasks = [];
-  this._firstJoin = true;
 }
 radiognuChannel.prototype = {
   __proto__: GenericConvChatPrototype,
-  _modes: [],
+  _modes: null,
   _receivedInitialMode: false,
   // For IRC you're not in a channel until the JOIN command is received, open
   // all channels (initially) as left.
   _left: true,
-  // True until successfully joined for the first time.
-  _firstJoin: false,
+  // True while we are rejoining a channel previously parted by the user.
+  _rejoined: false,
   banMasks: [],
-
-  // Overwrite the writeMessage function to apply CTCP formatting before
-  // display.
-  writeMessage: function(aWho, aText, aProperties) {
-    GenericConvChatPrototype.writeMessage.call(this, aWho,
-                                               ctcpFormatToHTML(aText),
-                                               aProperties);
-  },
-
-  // Stores the prplIChatRoomFieldValues required to join this channel
-  // to enable later reconnections. If absent, the MUC will not be reconnected
-  // automatically after disconnections.
-  _chatRoomFields: null,
 
   // Section 3.2.2 of RFC 2812.
   part: function(aMessage) {
@@ -304,7 +298,7 @@ radiognuChannel.prototype = {
     this._account.sendMessage("PART", params);
 
     // Remove reconnection information.
-    delete this._chatRoomFields;
+    delete this.chatRoomFields;
   },
 
   close: function() {
@@ -322,16 +316,12 @@ radiognuChannel.prototype = {
   // Use the normalized nick in order to properly notify the observers.
   getNormalizedChatBuddyName: function(aNick) this.normalizeNick(aNick),
 
-  hasParticipant: function(aNick)
-    hasOwnProperty(this._participants, this.normalizeNick(aNick)),
-
   getParticipant: function(aNick, aNotifyObservers) {
-    let normalizedNick = this.normalizeNick(aNick);
-    if (this.hasParticipant(aNick))
-      return this._participants[normalizedNick];
+    if (this._participants.has(aNick))
+      return this._participants.get(aNick);
 
     let participant = new radiognuParticipant(aNick, this);
-    this._participants[normalizedNick] = participant;
+    this._participants.set(aNick, participant);
 
     // Add the participant to the whois table if it is not already there.
     this._account.setWhois(participant._name);
@@ -343,7 +333,7 @@ radiognuChannel.prototype = {
     return participant;
   },
   updateNick: function(aOldNick, aNewNick) {
-    let isParticipant = this.hasParticipant(aOldNick);
+    let isParticipant = this._participants.has(aOldNick);
     if (this.normalizeNick(aOldNick) == this.normalizeNick(this.nick)) {
       // If this is the user's nick, change it.
       this.nick = aNewNick;
@@ -359,43 +349,51 @@ radiognuChannel.prototype = {
 
     // Get the original radiognuParticipant and then remove it.
     let participant = this.getParticipant(aOldNick);
-    this.removeParticipant(aOldNick);
+    this._participants.delete(aOldNick);
 
     // Update the nickname and add it under the new nick.
     participant._name = aNewNick;
-    this._participants[this.normalizeNick(aNewNick)] = participant;
+    this._participants.set(aNewNick, participant);
 
     this.notifyObservers(participant, "chat-buddy-update", aOldNick);
   },
-  removeParticipant: function(aNick, aNotifyObservers) {
-    if (!this.hasParticipant(aNick))
+  removeParticipant: function(aNick) {
+    if (!this._participants.has(aNick))
       return;
 
-    if (aNotifyObservers) {
-      let stringNickname = Cc["@mozilla.org/supports-string;1"]
-                              .createInstance(Ci.nsISupportsString);
-      stringNickname.data = aNick;
-      this.notifyObservers(new nsSimpleEnumerator([stringNickname]),
-                           "chat-buddy-remove");
-    }
-    delete this._participants[this.normalizeNick(aNick)];
+    let stringNickname = Cc["@mozilla.org/supports-string;1"]
+                           .createInstance(Ci.nsISupportsString);
+    stringNickname.data = aNick;
+    this.notifyObservers(new nsSimpleEnumerator([stringNickname]),
+                         "chat-buddy-remove");
+    this._participants.delete(aNick);
   },
   // Use this before joining to avoid errors of trying to re-add an existing
   // participant
   removeAllParticipants: function() {
     let stringNicknames = [];
-    for (let nickname in this._participants) {
+    this._participants.forEach(function(aParticipant) {
       let stringNickname = Cc["@mozilla.org/supports-string;1"]
                               .createInstance(Ci.nsISupportsString);
-      stringNickname.data = this._participants[nickname].name;
+      stringNickname.data = aParticipant.name;
       stringNicknames.push(stringNickname);
-    }
+    });
     this.notifyObservers(new nsSimpleEnumerator(stringNicknames),
                          "chat-buddy-remove");
-    this._participants = {};
+    this._participants.clear();
   },
 
+  /*
+   * Add/remove modes from this channel.
+   *
+   * aNewMode is the new mode string, it MUST begin with + or -.
+   * aModeParams is a list of ordered string parameters for the mode string.
+   * aSetter is the nick of the person (or service) that set the mode.
+   */
   setMode: function(aNewMode, aModeParams, aSetter) {
+    // Save this for a comparison after the new modes have been set.
+    let previousTopicSettable = this.topicSettable;
+
     const hostMaskExp = /^.+!.+@.+$/;
     function getNextParam() {
       // If there's no next parameter, throw a warning.
@@ -421,7 +419,7 @@ radiognuChannel.prototype = {
 
     // Check each mode being added and update the user.
     let channelModes = [];
-    let userModes = {};
+    let userModes = new NormalizedMap(this.normalizeNick.bind(this));
     let msg;
 
     for (let i = aNewMode.length - 1; i > 0; --i) {
@@ -429,13 +427,13 @@ radiognuChannel.prototype = {
       // implementations, check if a participant with that name exists. If this
       // is true, then update the mode of the ConvChatBuddy.
       if (this._account.memberStatuses.indexOf(aNewMode[i]) != -1 &&
-          aModeParams.length && this.hasParticipant(peekNextParam())) {
+          aModeParams.length && this._participants.has(peekNextParam())) {
         // Store the new modes for this nick (so each participant's mode is only
         // updated once).
-        let nick = this.normalizeNick(getNextParam());
-        if (!hasOwnProperty(userModes, nick))
-          userModes[nick] = [];
-        userModes[nick].push(aNewMode[i]);
+        let nick = getNextParam();
+        if (!userModes.has(nick))
+          userModes.set(nick, []);
+        userModes.get(nick).push(aNewMode[i]);
 
         // Don't use this mode as a channel mode.
         continue;
@@ -447,8 +445,8 @@ radiognuChannel.prototype = {
           let key = getNextParam();
           // A new channel key was set, display a message if this key is not
           // already known.
-          if (this._chatRoomFields &&
-              this._chatRoomFields.getValue("password") == key) {
+          if (this.chatRoomFields &&
+              this.chatRoomFields.getValue("password") == key) {
             continue;
           }
           msg = _("message.channelKeyAdded", aSetter, key);
@@ -459,7 +457,7 @@ radiognuChannel.prototype = {
 
         this.writeMessage(aSetter, msg, {system: true});
         // Store the new fields for reconnect.
-        this._chatRoomFields =
+        this.chatRoomFields =
           this._account.getChatRoomDefaultFieldValues(newFields);
       }
       else if (aNewMode[i] == "b") {
@@ -498,9 +496,16 @@ radiognuChannel.prototype = {
       this.WARN("Unused mode parameters: " + aModeParams.join(", "));
 
     // Update the mode of each participant.
-    for (let nick in userModes)
-      this.getParticipant(nick).setMode(addNewMode, userModes[nick], aSetter);
+    for (let [nick, mode] of userModes.entries())
+      this.getParticipant(nick).setMode(addNewMode, mode, aSetter);
 
+    // If the topic can now be set (and it couldn't previously) or vice versa,
+    // notify the UI. Note that this status can change by either a channel mode
+    // or a user mode changing.
+    if (this.topicSettable != previousTopicSettable)
+      this.notifyObservers(this, "chat-update-topic");
+
+    // If no channel modes were being set, don't display a message for it.
     if (!channelModes.length)
       return;
 
@@ -511,63 +516,58 @@ radiognuChannel.prototype = {
     msg = _("message.channelmode", aNewMode[0] + channelModes.join(""),
             aSetter);
     this.writeMessage(aSetter, msg, {system: true});
-    this.checkTopicSettable();
 
     this._receivedInitialMode = true;
   },
 
   setModesFromRestriction: function(aRestriction) {
     // First remove all types from the list of modes.
-    for each (let mode in this._account.channelRestrictionToModeMap) {
-      let index = this._modes.indexOf(mode);
-      this._modes.splice(index, index != -1);
-    }
+    for each (let mode in this._account.channelRestrictionToModeMap)
+      this._modes.delete(mode);
 
     // Add the new mode onto the list.
     if (aRestriction in this._account.channelRestrictionToModeMap) {
       let mode = this._account.channelRestrictionToModeMap[aRestriction];
       if (mode)
-        this._modes.push(mode);
+        this._modes.add(mode);
     }
   },
 
   get topic() this._topic, // can't add a setter without redefining the getter
   set topic(aTopic) {
+    // Note that the UI isn't updated here because the server will echo back the
+    // TOPIC to us and we'll set it on receive.
     this._account.sendMessage("TOPIC", [this.name, aTopic]);
   },
-  _previousTopicSettable: null,
-  checkTopicSettable: function() {
-    if (this.topicSettable == this._previousTopicSettable &&
-        this._previousTopicSettable != null)
-      return;
-
-    this.notifyObservers(this, "chat-update-topic");
-  },
   get topicSettable() {
-    // If we're not in the room yet, we don't exist.
-    if (!this.hasParticipant(this.nick))
+    // Don't use getParticipant since we don't want to lazily create it!
+    let participant = this._participants.get(this.nick);
+
+    // We must be in the room to set the topic.
+    if (!participant)
       return false;
 
     // If the channel mode is +t, hops and ops can set the topic; otherwise
     // everyone can.
-    let participant = this.getParticipant(this.nick);
-    return this._modes.indexOf("t") == -1 || participant.op ||
-           participant.halfOp;
+    return !this._modes.has("t") || participant.op || participant.halfOp;
   }
 };
-copySharedBaseToPrototype(GenericIRCConversation, radiognuChannel.prototype);
+Object.assign(radiognuChannel.prototype, GenericIRCConversation);
 
 function radiognuParticipant(aName, aConv) {
   this._name = aName;
   this._conv = aConv;
   this._account = aConv._account;
-  this._modes = [];
+  this._modes = new Set();
 
   // Handle multi-prefix modes.
   let i;
   for (i = 0; i < this._name.length &&
-              this._name[i] in this._account.userPrefixToModeMap; ++i)
-    this._modes.push(this._account.userPrefixToModeMap[this._name[i]]);
+              this._name[i] in this._account.userPrefixToModeMap; ++i) {
+    let mode = this._account.userPrefixToModeMap[this._name[i]];
+    if (mode)
+      this._modes.add(mode);
+  }
   this._name = this._name.slice(i);
 }
 radiognuParticipant.prototype = {
@@ -581,25 +581,19 @@ radiognuParticipant.prototype = {
                 this.name, aSetter);
     this._conv.writeMessage(aSetter, msg, {system: true});
     this._conv.notifyObservers(this, "chat-buddy-update");
-
-    // In case the new mode now lets us edit the topic.
-    if (this._account.normalize(this.name) ==
-        this._account.normalize(this._account._nickname))
-      this._conv.checkTopicSettable();
   },
 
-  get voiced() this._modes.indexOf("v") != -1,
-  get halfOp() this._modes.indexOf("h") != -1,
-  get op() this._modes.indexOf("o") != -1,
-  get founder()
-    this._modes.indexOf("O") != -1 || this._modes.indexOf("q") != -1,
+  get voiced() this._modes.has("v"),
+  get halfOp() this._modes.has("h"),
+  get op() this._modes.has("o"),
+  get founder() this._modes.has("O") || this._modes.has("q"),
   get typing() false
 };
 
 function radiognuConversation(aAccount, aName) {
   let nick = aAccount.normalize(aName);
-  if (hasOwnProperty(aAccount.whoisInformation, nick))
-    aName = aAccount.whoisInformation[nick]["nick"];
+  if (aAccount.whoisInformation.has(nick))
+    aName = aAccount.whoisInformation.get(nick)["nick"];
 
   this._init(aAccount, aName);
   this._observedNicks = [];
@@ -611,15 +605,7 @@ function radiognuConversation(aAccount, aName) {
 }
 radiognuConversation.prototype = {
   __proto__: GenericConvIMPrototype,
-  get buddy() this._account.getBuddy(this.name),
-
-  // Overwrite the writeMessage function to apply CTCP formatting before
-  // display.
-  writeMessage: function(aWho, aText, aProperties) {
-    GenericConvIMPrototype.writeMessage.call(this, aWho,
-                                             ctcpFormatToHTML(aText),
-                                             aProperties);
-  },
+  get buddy() this._account.buddies.get(this.name),
 
   unInit: function() {
     this.unInitIRCConversation();
@@ -631,7 +617,7 @@ radiognuConversation.prototype = {
     this.notifyObservers(null, "update-conv-title");
   }
 };
-copySharedBaseToPrototype(GenericIRCConversation, radiognuConversation.prototype);
+Object.assign(radiognuConversation.prototype, GenericIRCConversation);
 
 function radiognuSocket(aAccount) {
   this._account = aAccount;
@@ -692,7 +678,8 @@ radiognuSocket.prototype = {
       function(aStr) lowDequote[aStr[1]] || aStr[1]);
 
     try {
-      let message = new radiognuMessage(dequotedMessage);
+      let message = new radiognuMessage(dequotedMessage,
+                                   this._account._currentServerName);
       this.DEBUG(JSON.stringify(message) + conversionWarning);
       if (!ircHandlers.handleMessage(this._account, message)) {
         // If the message was not handled, throw a warning containing
@@ -784,14 +771,18 @@ radiognuAccountBuddy.prototype = {
 };
 
 function radiognuAccount(aProtocol, aImAccount) {
-  this._buddies = {};
   this._init(aProtocol, aImAccount);
-  this._conversations = {};
+  this.buddies = new NormalizedMap(this.normalizeNick.bind(this));
+  this.conversations = new NormalizedMap(this.normalize.bind(this));
 
   // Split the account name into usable parts.
   let splitter = this.name.lastIndexOf("@");
   this._accountNickname = this.name.slice(0, splitter);
   this._server = this.name.slice(splitter + 1);
+  // To avoid _currentServerName being null, initialize it to the server being
+  // connected to. This will also get overridden during the 001 response from
+  // the server.
+  this._currentServerName = this._server;
 
   this._nickname = this._accountNickname;
   this._requestedNickname = this._nickname;
@@ -799,10 +790,9 @@ function radiognuAccount(aProtocol, aImAccount) {
   // For more information, see where these are defined in the prototype below.
   this.trackQueue = [];
   this.pendingIsOnQueue = [];
-  this.whoisInformation = {};
-  this._chatRoomFieldsList = {};
-  this._caps = [];
-
+  this.whoisInformation = new NormalizedMap(this.normalizeNick.bind(this));
+  this._caps = new Set();
+  this._commandBuffers = new Map();
   this._roomInfoCallbacks = new Set();
 }
 radiognuAccount.prototype = {
@@ -818,10 +808,30 @@ radiognuAccount.prototype = {
   shouldAuthenticate: true,
   // Whether the user has successfully authenticated with NickServ.
   isAuthenticated: false,
+  // The current in use nickname.
+  _nickname: null,
   // The nickname stored in the account name.
   _accountNickname: null,
-  // The nickname that will be used when connecting.
+  // The nickname that was last requested by the user.
   _requestedNickname: null,
+  // The nickname that was last requested. This can differ from
+  // _requestedNickname when a new nick is automatically generated (e.g. by
+  // adding digits).
+  _sentNickname: null,
+  // If we don't get the desired nick on connect, we try again a bit later,
+  // to see if it wasn't just our nick not having timed out yet.
+  _nickInUseTimeout: null,
+  get username() {
+    let username;
+    // Use a custom username in a hidden preference.
+    if (this.prefs.prefHasUserValue("username"))
+      username = this.getString("username");
+    // But fallback to brandShortName if no username is provided (or is empty).
+    if (!username)
+      username = Services.appinfo.name;
+
+    return username;
+  },
   // The prefix minus the nick (!user@host) as returned by the server, this is
   // necessary for guessing message lengths.
   prefix: null,
@@ -900,7 +910,7 @@ radiognuAccount.prototype = {
   },
 
   // The user's user mode.
-  _modes: [],
+  _modes: null,
   _userModeReceived: false,
   setUserMode: function(aNick, aNewModes, aSetter, aDisplayFullMode) {
     if (this.normalizeNick(aNick) != this.normalizeNick(this._nickname)) {
@@ -925,7 +935,7 @@ radiognuAccount.prototype = {
     if (this._showServerTab) {
       let msg;
       if (aDisplayFullMode)
-        msg = _("message.yourmode", this._modes.join(""));
+        msg = _("message.yourmode", [mode for (mode of this._modes)].join(""));
       else {
         msg = _("message.usermode", aNewModes, aNick,
                 aSetter || this._currentServerName);
@@ -985,9 +995,98 @@ radiognuAccount.prototype = {
     delete this._pendingList;
   },
 
+  // The last time a buffered command was sent.
+  _lastCommandSendTime: 0,
+  // A map from command names to the parameter buffer for that command.
+  // This buffer is a map from first parameter to the corresponding (optional)
+  // second parameter, to ensure automatic deduplication.
+  _commandBuffers: new Map(),
+  _handleCommandBuffer: function(aCommand) {
+    let buffer = this._commandBuffers.get(aCommand);
+    if (!buffer.size)
+      return;
+    // This short delay should usually not affect commands triggered by
+    // user action, but helps gather commands together which are sent
+    // by the prpl on connection (e.g. WHOIS sent in response to incoming
+    // WATCH results).
+    const kInterval = 1000;
+    let delay = kInterval - (Date.now() - this._lastCommandSendTime);
+    if (delay > 0) {
+      setTimeout(() => this._handleCommandBuffer(aCommand), delay);
+      return;
+    }
+    this._lastCommandSendTime = Date.now();
+
+    let getParams = (aItems) => {
+      // Taking the JOIN use case as an example, aItems is an array
+      // of [channel, key] pairs.
+      // To work around an inspircd bug (bug 1108596), we reorder
+      // the list so that entries with keys appear first.
+      let items = aItems.slice().sort(([c1, k1], [c2, k2]) => {
+        if (!k1 && k2)
+          return 1;
+        if (k1 && !k2)
+          return -1;
+        return 0;
+      });
+      // To send the command, we have to group all the channels and keys
+      // together, i.e. grab the columns of this matrix, and build the two
+      // parameters of the command from that.
+      let channels = items.map(([channel, key]) => channel);
+      let keys = items.map(([channel, key]) => key).filter(key => !!key);
+      let params = [channels.join(",")];
+      if (keys.length)
+        params.push(keys.join(","));
+      return params;
+    };
+    let tooMany = (aItems) => {
+      let params = getParams(aItems);
+      let length = this.countBytes(this.buildMessage(aCommand, params)) + 2;
+      return this.maxMessageLength < length;
+    };
+    let send = (aItems) => {
+      let params = getParams(aItems);
+      // Send the command, but don't log the keys.
+      this.sendMessage(aCommand, params, aCommand + " " + params[0] +
+                       (params.length > 1 ? " <keys not logged>" : ""));
+    };
+
+    let items = [];
+    for (let item of buffer) {
+      items.push(item);
+      if (tooMany(items)) {
+        items.pop();
+        send(items);
+        items = [item];
+      }
+    }
+    send(items);
+    buffer.clear();
+  },
+  // For commands which allow an arbitrary number of parameters, we use a
+  // buffer to send as few commands as possible, by gathering the parameters.
+  // On servers which impose command penalties (e.g. inspircd) this helps
+  // avoid triggering fakelags by minimizing the command penalty.
+  // aParam is the first and aKey the optional second parameter of a command
+  // with the syntax <param> *("," <param>) [<key> *("," <key>)]
+  // While this code is mostly abstracted, it is currently assumed the second
+  // parameter is only used for JOIN.
+  sendBufferedCommand: function(aCommand, aParam, aKey = "") {
+    if (!this._commandBuffers.has(aCommand))
+      this._commandBuffers.set(aCommand, new Map());
+    let buffer = this._commandBuffers.get(aCommand);
+    // If the buffer is empty, schedule sending the command, otherwise
+    // we just need to add the parameter to the buffer.
+    // We use executeSoon so as to not delay the sending of these
+    // commands when it is not necessary.
+    if (!buffer.size)
+      executeSoon(() => this._handleCommandBuffer(aCommand));
+    buffer.set(aParam, aKey);
+  },
+
   // The whois information: nicks are used as keys and refer to a map of field
   // to value.
-  whoisInformation: {},
+  whoisInformation: null,
   // Request WHOIS information on a buddy when the user requests more
   // information.
   requestBuddyInfo: function(aBuddyName) {
@@ -995,7 +1094,7 @@ radiognuAccount.prototype = {
       return;
 
     this.removeBuddyInfo(aBuddyName);
-    this.sendMessage("WHOIS", aBuddyName);
+    this.sendBufferedCommand("WHOIS", aBuddyName);
   },
   notifyWhois: function(aNick) {
     Services.obs.notifyObservers(this.getBuddyInfo(aNick), "user-info-received",
@@ -1009,11 +1108,10 @@ radiognuAccount.prototype = {
   },
   // Return an nsISimpleEnumerator of imITooltipInfo for a given nick.
   getBuddyInfo: function(aNick) {
-    let nick = this.normalizeNick(aNick);
-    if (!hasOwnProperty(this.whoisInformation, nick))
+    if (!this.whoisInformation.has(aNick))
       return EmptyEnumerator;
 
-    let whoisInformation = this.whoisInformation[nick];
+    let whoisInformation = this.whoisInformation.get(aNick);
     if (whoisInformation.serverName && whoisInformation.serverInfo) {
       whoisInformation.server =
         _("tooltip.serverValue", whoisInformation.serverName,
@@ -1087,29 +1185,25 @@ radiognuAccount.prototype = {
     return new nsSimpleEnumerator(tooltipInfo);
   },
   // Remove a WHOIS entry.
-  removeBuddyInfo: function(aNick) {
-    let nick = this.normalizeNick(aNick);
-    if (hasOwnProperty(this.whoisInformation, nick))
-      delete this.whoisInformation[nick];
-  },
+  removeBuddyInfo: function(aNick) this.whoisInformation.delete(aNick),
   // Copies the fields of aFields into the whois table. If the field already
   // exists, that field is ignored (it is assumed that the first server response
   // is the most up to date information, as is the case for 312/314). Note that
   // the whois info for a nick is reset whenever whois information is requested,
   // so the first response from each whois is recorded.
   setWhois: function(aNick, aFields = {}) {
-    let nick = this.normalizeNick(aNick);
     // If the nickname isn't in the list yet, add it.
-    if (!hasOwnProperty(this.whoisInformation, nick))
-      this.whoisInformation[nick] = {};
+    if (!this.whoisInformation.has(aNick))
+      this.whoisInformation.set(aNick, {});
 
     // Set non-normalized nickname field.
-    this.whoisInformation[nick]["nick"] = aNick;
+    let whoisInfo = this.whoisInformation.get(aNick);
+    whoisInfo.nick = aNick;
 
     // Set the WHOIS fields, but only the first time a field is set.
     for (let field in aFields) {
-      if (!this.whoisInformation[nick].hasOwnProperty(field))
-        this.whoisInformation[nick][field] = aFields[field];
+      if (!whoisInfo.hasOwnProperty(field))
+        whoisInfo[field] = aFields[field];
     }
 
     return true;
@@ -1129,37 +1223,23 @@ radiognuAccount.prototype = {
   },
   addBuddy: function(aTag, aName) {
     let buddy = new radiognuAccountBuddy(this, null, aTag, aName);
-    this._buddies[buddy.normalizedName] = buddy;
+    this.buddies.set(buddy.normalizedName, buddy);
     this.trackBuddy(buddy.userName);
 
     Services.contacts.accountBuddyAdded(buddy);
   },
   removeBuddy: function(aBuddy) {
-    delete this._buddies[aBuddy.normalizedName];
+    this.buddies.delete(aBuddy.normalizedName);
     this.untrackBuddy(aBuddy.userName);
   },
   // Loads a buddy from the local storage. Called for each buddy locally stored
   // before connecting to the server.
   loadBuddy: function(aBuddy, aTag) {
     let buddy = new radiognuAccountBuddy(this, aBuddy, aTag);
-    this._buddies[buddy.normalizedName] = buddy;
+    this.buddies.set(buddy.normalizedName, buddy);
     this.trackBuddy(buddy.userName);
 
     return buddy;
-  },
-  hasBuddy: function(aName)
-    hasOwnProperty(this._buddies, this.normalizeNick(aName)),
-  // Return an array of buddy names.
-  getBuddyNames: function() {
-    let buddies = [];
-    for each (let buddyName in Object.keys(this._buddies))
-      buddies.push(this._buddies[buddyName].userName);
-    return buddies;
-  },
-  getBuddy: function(aName) {
-    if (this.hasBuddy(aName))
-      return this._buddies[this.normalizeNick(aName)];
-    return null;
   },
   changeBuddyNick: function(aOldNick, aNewNick) {
     let msg;
@@ -1167,22 +1247,22 @@ radiognuAccount.prototype = {
       // Your nickname changed!
       this._nickname = aNewNick;
       msg = _("message.nick.you", aNewNick);
-      for each (let conversation in this._conversations) {
+      this.conversations.forEach(conversation => {
         // Update the nick for chats, and inform the user in every conversation.
         if (conversation.isChat)
           conversation.updateNick(aOldNick, aNewNick);
         conversation.writeMessage(aOldNick, msg, {system: true});
-      }
+      });
     }
     else {
       msg = _("message.nick", aOldNick, aNewNick);
-      for each (let conversation in this._conversations) {
-        if (conversation.isChat && conversation.hasParticipant(aOldNick)) {
+      this.conversations.forEach(conversation => {
+        if (conversation.isChat && conversation._participants.has(aOldNick)) {
           // Update the nick in every chat conversation it is in.
           conversation.updateNick(aOldNick, aNewNick);
           conversation.writeMessage(aOldNick, msg, {system: true});
         }
-      }
+      });
     }
 
     // Adjust the whois table where necessary.
@@ -1190,19 +1270,26 @@ radiognuAccount.prototype = {
     this.setWhois(aNewNick);
 
     // If a private conversation is open with that user, change its title.
-    if (this.hasConversation(aOldNick)) {
+    if (this.conversations.has(aOldNick)) {
       // Get the current conversation and rename it.
       let conversation = this.getConversation(aOldNick);
 
       // Remove the old reference to the conversation and create a new one.
       this.removeConversation(aOldNick);
-      this._conversations[this.normalizeNick(aNewNick)] = conversation;
+      this.conversations.set(aNewNick, conversation);
 
       conversation.updateNick(aNewNick);
       conversation.writeMessage(aOldNick, msg, {system: true});
     }
   },
 
+  /*
+   * Ask the server to change the user's nick.
+   */
+  changeNick: function(aNewNick) {
+    this._sentNickname = aNewNick;
+    this.sendMessage("NICK", aNewNick); // Nick message.
+  },
   /*
    * Generate a new nick to change to if the user requested nick is already in
    * use or is otherwise invalid.
@@ -1227,12 +1314,13 @@ radiognuAccount.prototype = {
     if (oldIndex != -1 && oldIndex < allNicks.length - 1) {
       let newNick = allNicks[oldIndex + 1];
       this.LOG(aOldNick + " is already in use, trying " + newNick);
-      this.sendMessage("NICK", newNick); // Nick message.
+      this.changeNick(newNick);
       return true;
     }
 
     // Separate the nick into the text and digits part.
-    let nickParts = /^(.+?)(\d*)$/.exec(aOldNick);
+    let kNickPattern = /^(.+?)(\d*)$/;
+    let nickParts = kNickPattern.exec(aOldNick);
     let newNick = nickParts[1];
 
     // No nick found from the user's preferences, so just generating one.
@@ -1248,12 +1336,23 @@ radiognuAccount.prototype = {
         newDigits = "0".repeat(numLeadingZeros) + newDigits;
     }
 
-    // If the nick will be too long, ensure all the digits fit.
-    if (newNick.length + newDigits.length > this.maxNicknameLength) {
+    // Servers truncate nicks that are too long, compare the previously sent
+    // nickname with the returned nickname and check for truncation.
+    if (aOldNick.length < this._sentNickname.length) {
+      // The nick will be too long, overwrite the end of the nick instead of
+      // appending.
+      let maxLength = aOldNick.length;
+
+      let sentNickParts = kNickPattern.exec(this._sentNickname);
+      // Resend the same digits as last time, but overwrite part of the nick
+      // this time.
+      if (nickParts[2] && sentNickParts[2])
+        newDigits = sentNickParts[2];
+
       // Handle the silly case of a single letter followed by all nines.
       if (newDigits.length == this.maxNicknameLength)
         newDigits = newDigits.slice(1);
-      newNick = newNick.slice(0, this.maxNicknameLength - newDigits.length);
+      newNick = newNick.slice(0, maxLength - newDigits.length);
     }
     // Append the digits.
     newNick += newDigits;
@@ -1263,13 +1362,13 @@ radiognuAccount.prototype = {
       // the user attempted to change to a version of the nick with a lower or
       // absent number suffix, and this failed.
       let msg = _("message.nick.fail", this._nickname);
-      for each (let conversation in this._conversations)
-        conversation.writeMessage(this._nickname, msg, {system: true});
+      this.conversations.forEach(conversation =>
+        conversation.writeMessage(this._nickname, msg, {system: true}));
       return true;
     }
 
     this.LOG(aOldNick + " is already in use, trying " + newNick);
-    this.sendMessage("NICK", newNick); // Nick message.
+    this.changeNick(newNick);
     return true;
   },
 
@@ -1279,7 +1378,7 @@ radiognuAccount.prototype = {
 
     // The received timestamp is invalid.
     if (isNaN(sentTime)) {
-      this.WARN(aMessage.servername +
+      this.WARN(aMessage.origin +
                 " returned an invalid timestamp from a PING: " + aPongTime);
       return false;
     }
@@ -1290,8 +1389,8 @@ radiognuAccount.prototype = {
     // If the delay is negative or greater than 1 minute, something is
     // feeding us a crazy value. Don't display this to the user.
     if (delay < 0 || 60 * 1000 < delay) {
-      this.WARN(aMessage.servername +
-                " returned an invalid delay from a PING: " + delay);
+      this.WARN(aMessage.origin + " returned an invalid delay from a PING: " +
+                delay);
       return false;
     }
 
@@ -1382,8 +1481,18 @@ radiognuAccount.prototype = {
     this._isOnTimer = setTimeout(this.sendIsOn.bind(this), this._isOnDelay);
   },
 
+  // The message of the day uses two fields to append messages.
+  _motd: null,
+  _motdTimer: null,
+
   connect: function() {
     this.reportConnecting();
+
+    // Mark existing MUCs as joining if they will be rejoined.
+    this.conversations.forEach(conversation => {
+      if (conversation.isChat && conversation.chatRoomFields)
+        conversation.joining = true;
+    });
 
     // Load preferences.
     this._port = this.getInt("port");
@@ -1403,17 +1512,31 @@ radiognuAccount.prototype = {
   // If a cap is to be handled, it should be registered with addCAP, where aCAP
   // is a "unique" string defining what is being handled. When the cap is done
   // being handled removeCAP should be called with the same string.
-  _caps: [],
+  _caps: new Set(),
   _capTimeout: null,
   addCAP: function(aCAP) {
-    this._caps.push(aCAP);
+    if (this.connected) {
+      this.ERROR("Trying to add CAP " + aCAP + " after connection.");
+      return;
+    }
+
+    this._caps.add(aCAP);
   },
   removeCAP: function(aDoneCAP) {
+    if (!this._caps.has(aDoneCAP)) {
+      this.ERROR("Trying to remove a CAP (" + aDoneCAP + ") which isn't added.");
+      return;
+    }
+    if (this.connected) {
+      this.ERROR("Trying to remove CAP " + aDoneCAP + " after connection.");
+      return;
+    }
+
     // Remove any reference to the given capability.
-    this._caps = this._caps.filter(function(aCAP) aCAP != aDoneCAP);
+    this._caps.delete(aDoneCAP);
 
     // If no more CAP messages are being handled, notify the server.
-    if (!this._caps.length)
+    if (!this._caps.size)
       this.sendMessage("CAP", "END");
   },
 
@@ -1451,42 +1574,46 @@ radiognuAccount.prototype = {
 
   createConversation: function(aName) this.getConversation(aName),
 
-  // Temporarily stores the prplIChatRoomFieldValues passed to joinChat for
-  // each channel to enable later reconnections.
-  _chatRoomFieldsList: {},
-
   // aComponents implements prplIChatRoomFieldValues.
   joinChat: function(aComponents) {
     let channel = aComponents.getValue("channel");
+    // Mildly sanitize input.
+    channel = channel.trimLeft().split(",")[0].split(" ")[0];
     if (!channel) {
-      this.ERROR("joinChat called without a channel name.");
-      return;
+      this.ERROR("joinChat called without a valid channel name.");
+      return null;
     }
+
     // A channel prefix is required. If the user didn't include one,
     // we prepend # automatically to match the behavior of other
     // clients. Not doing it used to cause user confusion.
     if (this.channelPrefixes.indexOf(channel[0]) == -1)
       channel = "#" + channel;
 
-    // No need to join a channel we are already in.
-    if (this.hasConversation(channel)) {
+    if (this.conversations.has(channel)) {
       let conv = this.getConversation(channel);
-      if (!conv.left)
+      if (!conv.left) {
+        // No need to join a channel we are already in.
         return conv;
+      }
+      else if (!conv.chatRoomFields) {
+        // We are rejoining a channel that was parted by the user.
+        conv._rejoined = true;
+      }
     }
 
-    let params = [channel];
     let key = aComponents.getValue("password");
-    if (key)
-      params.push(key);
-    let defaultName = key ? channel + " " + key : channel;
-    this._chatRoomFieldsList[this.normalize(channel)] =
-      this.getChatRoomDefaultFieldValues(defaultName);
-    // Send the join command, but don't log the channel key.
-    this.sendMessage("JOIN", params,
-                     "JOIN " + channel + (key ? " <key not logged>" : ""));
+    this.sendBufferedCommand("JOIN", channel, key);
+
     // Open conversation early for better responsiveness.
-    return this.getConversation(channel);
+    let conv = this.getConversation(channel);
+    conv.joining = true;
+
+    // Store the prplIChatRoomFieldValues to enable later reconnections.
+    let defaultName = key ? channel + " " + key : channel;
+    conv.chatRoomFields = this.getChatRoomDefaultFieldValues(defaultName);
+
+    return conv;
   },
 
   chatRoomFields: {
@@ -1505,30 +1632,26 @@ radiognuAccount.prototype = {
   // Attributes
   get canJoinChat() true,
 
-  hasConversation: function(aConversationName)
-    hasOwnProperty(this._conversations, this.normalize(aConversationName)),
-
   // Returns a conversation (creates it if it doesn't exist)
   getConversation: function(aName) {
-    let name = this.normalize(aName);
-    // If the whois information has been received, we have the proper nick
-    // capitalization.
-    if (hasOwnProperty(this.whoisInformation, name))
-      aName = this.whoisInformation[name].nick;
-    if (!this.hasConversation(aName)) {
-      let constructor = this.isMUCName(aName) ? radiognuChannel : radiognuConversation;
-      this._conversations[name] = new constructor(this, aName, this._nickname);
+    if (!this.conversations.has(aName)) {
+      // If the whois information has been received, we have the proper nick
+      // capitalization.
+      if (this.whoisInformation.has(aName))
+        aName = this.whoisInformation.get(aName).nick;
+      let convClass = this.isMUCName(aName) ? radiognuChannel : radiognuConversation;
+      this.conversations.set(aName, new convClass(this, aName, this._nickname));
     }
-    return this._conversations[name];
+    return this.conversations.get(aName);
   },
 
   removeConversation: function(aConversationName) {
-    if (this.hasConversation(aConversationName))
-      delete this._conversations[this.normalize(aConversationName)];
+    if (this.conversations.has(aConversationName))
+      this.conversations.delete(aConversationName);
   },
 
   // This builds the message string that will be sent to the server.
-  buildMessage: function(aCommand, aParams) {
+  buildMessage: function(aCommand, aParams = []) {
     if (!aCommand) {
       this.ERROR("IRC messages must have a command.");
       return null;
@@ -1541,9 +1664,9 @@ radiognuAccount.prototype = {
     }
 
     let message = aCommand;
-    // If aParams is empty, then use an empty array. If aParams is not an array,
-    // consider it to be a single parameter and put it into an array.
-    let params = !aParams ? [] : Array.isArray(aParams) ? aParams : [aParams];
+    // If aParams is not an array, consider it to be a single parameter and put
+    // it into an array.
+    let params = Array.isArray(aParams) ? aParams : [aParams];
     if (params.length) {
       if (params.slice(0, -1).some(function(p) p.contains(" "))) {
         this.ERROR("IRC parameters cannot have spaces: " + params.slice(0, -1));
@@ -1613,12 +1736,12 @@ radiognuAccount.prototype = {
 
   // CTCP messages are \001<COMMAND> [<parameters>]*\001.
   // Returns false if the message could not be sent.
-  sendCTCPMessage: function(aCommand, aParams, aTarget, aIsNotice) {
+  sendCTCPMessage: function(aTarget, aIsNotice, aCtcpCommand, aParams = []) {
     // Combine the CTCP command and parameters into the single IRC param.
-    let ircParam = aCommand;
-    // If aParams is empty, then use an empty array. If aParams is not an array,
-    // consider it to be a single parameter and put it into an array.
-    let params = !aParams ? [] : Array.isArray(aParams) ? aParams : [aParams];
+    let ircParam = aCtcpCommand;
+    // If aParams is not an array, consider it to be a single parameter and put
+    // it into an array.
+    let params = Array.isArray(aParams) ? aParams : [aParams];
     if (params.length)
       ircParam += " " + params.join(" ");
 
@@ -1646,34 +1769,29 @@ radiognuAccount.prototype = {
     }
 
     // Send the nick message (section 3.1.2).
-    this.sendMessage("NICK", this._requestedNickname);
+    this.changeNick(this._requestedNickname);
 
     // Send the user message (section 3.1.3).
-    let username;
-    // Use a custom username in a hidden preference.
-    if (this.prefs.prefHasUserValue("username"))
-      username = this.getString("username");
-    // But fallback to brandShortName if no username is provided (or is empty).
-    if (!username)
-      username = Services.appinfo.name;
-    this.sendMessage("USER", [username, this._mode.toString(), "*",
+    this.sendMessage("USER", [this.username, this._mode.toString(), "*",
                               this._realname || this._requestedNickname]);
   },
 
   _reportDisconnecting: function(aErrorReason, aErrorMessage) {
     this.reportDisconnecting(aErrorReason, aErrorMessage);
 
+    // Cancel any pending buffered commands.
+    this._commandBuffers.clear();
+
     // Mark all contacts on the account as having an unknown status.
-    for each (let buddy in this._buddies)
-      buddy.setStatus(Ci.imIStatusInfo.STATUS_UNKNOWN, "");
+    this.buddies.forEach(function(aBuddy)
+      aBuddy.setStatus(Ci.imIStatusInfo.STATUS_UNKNOWN, ""));
   },
 
-  gotDisconnected: function(aError, aErrorMessage) {
+  gotDisconnected: function(aError = Ci.prplIAccount.NO_ERROR,
+                            aErrorMessage = "") {
     if (!this.imAccount || this.disconnected)
        return;
 
-    if (aError === undefined)
-      aError = Ci.prplIAccount.NO_ERROR;
     // If we are already disconnecting, this call to gotDisconnected
     // is when the server acknowledges our disconnection.
     // Otherwise it's because we lost the connection.
@@ -1682,21 +1800,35 @@ radiognuAccount.prototype = {
     this._socket.disconnect();
     delete this._socket;
 
+    this._caps.clear();
+
     clearTimeout(this._isOnTimer);
     delete this._isOnTimer;
+
+    // MOTD will be resent.
+    delete this._motd;
+    clearTimeout(this._motdTimer)
+    delete this._motdTimer;
 
     // We must authenticate if we reconnect.
     delete this.isAuthenticated;
 
+    // Clear any pending attempt to regain our nick.
+    clearTimeout(this._nickInUseTimeout);
+    delete this._nickInUseTimeout;
+
     // Clean up each conversation: mark as left and remove participant.
-    for each (let conversation in this._conversations) {
-      if (conversation.isChat && !conversation.left) {
-        // Remove the user's nick and mark the conversation as left as that's
-        // the final known state of the room.
-        conversation.removeParticipant(this._nickname, true);
-        conversation.left = true;
+    this.conversations.forEach(conversation => {
+      if (conversation.isChat) {
+        conversation.joining = false; // In case we never finished joining.
+        if (!conversation.left) {
+          // Remove the user's nick and mark the conversation as left as that's
+          // the final known state of the room.
+          conversation.removeParticipant(this._nickname);
+          conversation.left = true;
+        }
       }
-    }
+    });
 
     // If we disconnected during a pending LIST request, make sure callbacks
     // receive any remaining channels.
@@ -1704,18 +1836,16 @@ radiognuAccount.prototype = {
       this._sendRemainingRoomInfo();
 
     // Clear whois table.
-    this.whoisInformation = {};
+    this.whoisInformation.clear();
 
     this.reportDisconnected();
   },
 
   remove: function() {
-    for each (let conv in this._conversations)
-      conv.close();
-    delete this._conversations;
-    for each (let buddy in this._buddies)
-      buddy.remove();
-    delete this._buddies;
+    this.conversations.forEach(conv => conv.close());
+    delete this.conversations;
+    this.buddies.forEach(function(aBuddy) aBuddy.remove());
+    delete this.buddies;
   },
 
   unInit: function() {
