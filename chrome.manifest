@@ -1,5 +1,6 @@
-skin    prpl-radiognu         classic/1.0 chrome/skin/
-locale	prpl-radiognu	en-US		chrome/locale/en-US/
+skin    prpl-radiognu classic/1.0 chrome/skin/
+locale	prpl-radiognu	en-US		    chrome/locale/en-US/
+content prpl-radiognu             chrome/content/
 
 component {a58207a0-df1f-11e4-8830-0800200c9a66} components/radiognu.js
 contract @mozilla.org/chat/radiognu;1 {a58207a0-df1f-11e4-8830-0800200c9a66}

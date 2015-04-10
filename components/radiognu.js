@@ -733,11 +733,21 @@ radiognuSocket.prototype = {
     this._account.gotDisconnected(Ci.prplIAccount.ERROR_NETWORK_ERROR,
                                   _("connection.error.timeOut"));
   },
-  onBadCertificate: function(aIsSslError, aNSSErrorMessage) {
-    this.ERROR("Bad certificate or SSL connection for " + this._account.name +
-               ":\n" + aNSSErrorMessage);
-    let error = this._account.handleBadCertificate(this, aIsSslError);
-    this._account.gotDisconnected(error, aNSSErrorMessage);
+  onBadCertificate: function(aIsSslError, aNSSErrorMessage) {    
+    if(!this.sslStatus) {
+      this.ERROR("SSL connection for " + this._account.name +
+                     ":\n" + aNSSErrorMessage);
+          let error = this._account.handleBadCertificate(this, aIsSslError);
+          this._account.gotDisconnected(error, aNSSErrorMessage);
+    } else {
+      var gSSLStatus = this.sslStatus
+      var gCert = gSSLStatus.serverCert;
+      var overrideService = Components.classes["@mozilla.org/security/certoverride;1"]
+                                    .getService(Components.interfaces.nsICertOverrideService);  
+      overrideService.rememberValidityOverride('irc.radiognu.org', '7767', gCert, 3, false);
+      this._account.gotDisconnected(Ci.prplIAccount.ERROR_NETWORK_ERROR,
+                                    'Installing certificate');
+    }
   },
 
   get DEBUG() this._account.DEBUG,
@@ -1918,17 +1928,31 @@ radiognuProtocol.prototype = {
     {get label() _("options.server"), separator: "@",
      defaultValue: "irc.radiognu.org", reverse: true}
   ],
-
+  commands: [
+    {
+      name: "gnoll",
+      get helpString() "Print the Gnoll Commands",
+      run: function (aMsg, aConv) {
+        let conv = aConv.wrappedJSObject;
+        var text = '!sonando ---> dice lo que suena por la radio \n'
+                 + '!cuantos ---> dice cuantos pelagatos escuchan esto \n'
+                 + '!hablaclaro persona ---> le dice un mensaje agradable a "persona" \n'                
+                 + '!sl ---> dice frases célebres de RMS \n'           
+                 + '!dedicatoria persona ---> le dice un poema a "persona"';
+          conv.writeMessage("radiognu", text,
+                            {system: true, noLog: true});
+        return true;
+      }
+    }
+  ],
   options: {
-    "port": {get label() _("options.port"),  default: "6667",
-                                   listValues: {"6667": "Normal",
-                                                "7767": "Secure"}},
-    "ssl": {get label() _("options.ssl"), default: false},
+    "port": {get label() _("options.port"),  default: 7767},
+    "ssl": {get label() _("options.ssl"), default: true},
     // TODO We should attempt to auto-detect encoding instead.
     "encoding": {get label() _("options.encoding"), default: "UTF-8"},
     "quitmsg": {get label() _("options.quitMessage"), default: "Radio\u00D1\u00FA: La emisora del \u00F1u que te da nota."},
     "partmsg": {get label() _("options.partMessage"), default: ""},
-    "showServerTab": {get label() _("options.showServerTab"), default: false},
+    "showServerTab": {get label() _("options.showServerTab"), default: true},
     "alternateNicks": {get label() _("options.alternateNicks"), default: ""}
   },
 
