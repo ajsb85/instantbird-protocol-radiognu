@@ -4,7 +4,7 @@
 		<em:id>prpl-radiognu@alexandersalas.name</em:id>
 		<em:unpack>true</em:unpack>
 		<em:name>RadioGNU Protocol</em:name>
-		<em:version>1.0</em:version>
+		<em:version>0.3</em:version>
     <em:type>2</em:type>
     <em:strictCompatibility>true</em:strictCompatibility>
     <em:multiprocessCompatible>true</em:multiprocessCompatible>
